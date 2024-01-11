@@ -1,0 +1,9 @@
+
+
+GET /api/initialize-database
+###
+
+
+
+GET http://localhost:3001/api/transactions
+###
