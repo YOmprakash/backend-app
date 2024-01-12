@@ -1,24 +1,79 @@
-// backend/index.js
+// server.js or app.js
 const express = require("express");
-const fetch = import("node-fetch");
 const cors = require("cors");
+const sqlite3 = require("sqlite3");
+const axios = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-console.log(PORT);
 
 app.use(express.json());
 app.use(cors());
 
-let transactionsData = [];
+// Use an SQLite database
+const database = new sqlite3.Database(":memory:");
+
+const initializeDbAndServer = async () => {
+  try {
+    await database.run(`
+      CREATE TABLE IF NOT EXISTS "transaction" (
+        id INTEGER PRIMARY KEY,
+        title TEXT,
+        price REAL,
+        description TEXT,
+        category TEXT,
+        image TEXT,
+        sold INTEGER,
+        dateOfSale TEXT
+      );
+    `);
+    console.log("Database initialized successfully");
+
+    // Delay the data retrieval to ensure database creation is completed
+    setTimeout(() => {
+      getData("https://s3.amazonaws.com/roxiler.com/product_transaction.json");
+    }, 5000);
+  } catch (error) {
+    console.error(error);
+  }
+};
+
+initializeDbAndServer();
+
+async function getData(url) {
+  try {
+    const { data } = await axios.get(url);
+    data.forEach((d) => {
+      console.log("Inserting data:", d);
+
+      let sql = `INSERT INTO "transaction"(id,title,price,description,category,image,sold,dateOfSale) VALUES(?,?,?,?,?,?,?,?)`;
+
+      try {
+        database.run(sql, [
+          d.id,
+          d.title,
+          d.price,
+          d.description,
+          d.category,
+          d.image,
+          d.sold,
+          d.dateOfSale,
+        ]);
+      } catch (error) {
+        console.error("Error inserting data:", error);
+      }
+    });
+  } catch (e) {
+    console.log(e);
+  }
+}
 
 app.get("/api/initialize-database", async (req, res) => {
   try {
-    const response = await fetch(
+    const response = await axios.get(
       "https://s3.amazonaws.com/roxiler.com/product_transaction.json"
     );
-    transactionsData = await response.json();
-    console.log(transactionsData);
+    const transactionsData = response.data;
     res.json({ message: "Database initialized successfully" });
   } catch (error) {
     console.error(error);
@@ -26,49 +81,83 @@ app.get("/api/initialize-database", async (req, res) => {
   }
 });
 
-app.get("/api/transactions", (req, res) => {
+app.get("/api/transactions", async (req, res) => {
   const { month, page = 1, perPage = 10, searchText } = req.query;
+  console.log("Fetching transactions for month:", month);
+  let filteredTransactions = await database.all(
+    `
+      SELECT * FROM "transaction"
+      WHERE dateOfSale LIKE ? AND (
+        ? OR title LIKE ? OR description LIKE ? OR price LIKE ?
+      )
+      LIMIT ? OFFSET ?
+    `,
+    [
+      `${month}%`,
+      !searchText,
+      `%${searchText}%`,
+      `%${searchText}%`,
+      `%${searchText}%`,
+      perPage,
+      (page - 1) * perPage,
+    ]
+  );
+  console.log("Filtered transactions:", filteredTransactions);
 
-  let filteredTransactions = transactionsData.filter((transaction) => {
-    return (
-      transaction.dateOfSale.startsWith(month) &&
-      (searchText
-        ? transaction.title.includes(searchText) ||
-          transaction.description.includes(searchText) ||
-          transaction.price.toString().includes(searchText)
-        : true)
-    );
-  });
-
-  const startIndex = (page - 1) * perPage;
-  const endIndex = startIndex + parseInt(perPage, 10);
-  filteredTransactions = filteredTransactions.slice(startIndex, endIndex);
-
-  res.json({
-    transactions: filteredTransactions,
-    total: transactionsData.length,
-  });
+  let total = await database.get(
+    `
+    SELECT COUNT(*) as total FROM "transaction"
+    WHERE dateOfSale LIKE ? AND (
+      ? OR title LIKE ? OR description LIKE ? OR price LIKE ?
+    )
+  `,
+    [
+      `${month}%`,
+      !searchText,
+      `%${searchText}%`,
+      `%${searchText}%`,
+      `%${searchText}%`,
+    ]
+  );
+  console.log("Total transactions:", total);
+  res.json({ transactions: filteredTransactions, total: total.total });
 });
 
-app.get("/api/statistics", (req, res) => {
+app.get("/api/statistics", async (req, res) => {
   const { month } = req.query;
 
-  const totalSaleAmount = transactionsData
-    .filter((transaction) => transaction.dateOfSale.startsWith(month))
-    .reduce((sum, transaction) => sum + transaction.price, 0);
+  const totalSaleAmount = await database.get(
+    `
+    SELECT IFNULL(SUM(price), 0) as totalSaleAmount FROM "transaction"
+    WHERE dateOfSale LIKE ?
+  `,
+    [`${month}%`]
+  );
 
-  const totalSoldItems = transactionsData.filter((transaction) =>
-    transaction.dateOfSale.startsWith(month)
-  ).length;
+  const totalSoldItems = await database.get(
+    `
+    SELECT COUNT(*) as totalSoldItems FROM "transaction"
+    WHERE dateOfSale LIKE ?
+  `,
+    [`${month}%`]
+  );
 
-  const totalNotSoldItems = transactionsData.filter(
-    (transaction) => !transaction.dateOfSale.startsWith(month)
-  ).length;
+  const totalNotSoldItems = await database.get(
+    `
+    SELECT COUNT(*) as totalNotSoldItems FROM "transaction"
+    WHERE NOT dateOfSale LIKE ?
+  `,
+    [`${month}%`]
+  );
 
-  res.json({ totalSaleAmount, totalSoldItems, totalNotSoldItems });
+  res.json({
+    totalSaleAmount: totalSaleAmount.totalSaleAmount,
+    totalSoldItems: totalSoldItems.totalSoldItems,
+    totalNotSoldItems: totalNotSoldItems.totalNotSoldItems,
+  });
 });
 
-app.get("/api/bar-chart", (req, res) => {
+app.get("/api/bar-chart", async (req, res) => {
   const { month } = req.query;
 
   const priceRanges = [
@@ -84,19 +173,22 @@ app.get("/api/bar-chart", (req, res) => {
     { min: 901, max: Infinity },
   ];
 
-  const barChartData = priceRanges.map((range) => {
-    const numItems = transactionsData.filter(
-      (transaction) =>
-        transaction.dateOfSale.startsWith(month) &&
-        transaction.price >= range.min &&
-        transaction.price <= range.max
-    ).length;
+  const barChartData = await Promise.all(
+    priceRanges.map(async (range) => {
+      const numItems = await database.get(
+        `
+      SELECT IFNULL(COUNT(*), 0) as numItems FROM "transaction"
+      WHERE dateOfSale LIKE ? AND price >= ? AND price <= ?
+    `,
+        [`${month}%`, range.min, range.max]
+      );
 
-    return {
-      priceRange: `${range.min} - ${range.max}`,
-      numItems,
-    };
-  });
+      return {
+        priceRange: `${range.min} - ${range.max}`,
+        numItems: numItems.numItems,
+      };
+    })
+  );
 
   res.json(barChartData);
 });
